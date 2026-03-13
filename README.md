@@ -5,7 +5,7 @@
 ```
 $ share-run
 
-👤 GitHub user detected: darling
+👤 GitHub user detected: ryqtor
 📁 Project detected: portfolio
 🔍 Stack detected: Node.js
 📦 Packaging project
@@ -13,7 +13,7 @@ $ share-run
 🚀 Building container
 
 🌍 Deployment ready!
-https://darling-portfolio.run.dev
+https://ryqtor-portfolio.run.dev
 ```
 
 ---
