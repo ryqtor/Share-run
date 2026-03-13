@@ -1,0 +1,59 @@
+# ┌───────────────────────────────────────────────────────────────┐
+# │  share-run — Docker Compose                                  │
+# │  Orchestrates: Traefik reverse proxy + share-run server      │
+# └───────────────────────────────────────────────────────────────┘
+
+version: "3.8"
+
+networks:
+  sharerun-network:
+    name: sharerun-network
+    driver: bridge
+
+services:
+  # ── Traefik Reverse Proxy ──────────────────────────────────────
+  traefik:
+    image: traefik:v3.0
+    container_name: sharerun-traefik
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8080:8080"   # Traefik dashboard
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - traefik-certs:/letsencrypt
+    environment:
+      # Cloudflare API credentials for DNS challenge (Let's Encrypt)
+      - CF_API_EMAIL=${CF_API_EMAIL}
+      - CF_DNS_API_TOKEN=${CF_DNS_API_TOKEN}
+    networks:
+      - sharerun-network
+
+  # ── Share-Run Server ───────────────────────────────────────────
+  server:
+    build: ./server
+    container_name: sharerun-server
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./server/uploads:/app/uploads
+      - ./server/deployments:/app/deployments
+    environment:
+      - PORT=3001
+      - NODE_ENV=production
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.sharerun-api.rule=Host(`api.run.dev`)"
+      - "traefik.http.routers.sharerun-api.entrypoints=websecure"
+      - "traefik.http.routers.sharerun-api.tls=true"
+      - "traefik.http.routers.sharerun-api.tls.certresolver=letsencrypt"
+      - "traefik.http.services.sharerun-api.loadbalancer.server.port=3001"
+    networks:
+      - sharerun-network
+
+volumes:
+  traefik-certs:

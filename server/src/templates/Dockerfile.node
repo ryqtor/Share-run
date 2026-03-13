@@ -1,0 +1,20 @@
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Accept port as build arg and env var
+ARG PORT=3000
+ENV PORT=${PORT}
+
+# Install dependencies
+COPY package*.json ./
+RUN npm install --production
+
+# Copy application code
+COPY . .
+
+# Expose the port
+EXPOSE ${PORT}
+
+# Start the application
+CMD ["npm", "start"]

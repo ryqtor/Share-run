@@ -1,0 +1,35 @@
+# Traefik Static Configuration
+# ─────────────────────────────────────────────────────────────────
+
+api:
+  dashboard: true
+  insecure: true  # Enable dashboard at http://localhost:8080
+
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: http
+  websecure:
+    address: ":443"
+
+providers:
+  docker:
+    endpoint: "unix:///var/run/docker.sock"
+    exposedByDefault: false
+    network: sharerun-network
+    watch: true
+
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: "admin@run.dev"             # ← update with your email
+      storage: "/letsencrypt/acme.json"
+      dnsChallenge:
+        provider: cloudflare
+        resolvers:
+          - "1.1.1.1:53"
+          - "8.8.8.8:53"
