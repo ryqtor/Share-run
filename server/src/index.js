@@ -14,6 +14,15 @@ const fs = require('fs-extra');
 const deployRoute = require('./routes/deploy');
 const deploymentStore = require('./services/deployment-store');
 
+// ── CRASH GUARDS ───────────────────────────────────────────────────
+process.on('unhandledRejection', (reason) => {
+  console.error('[CRASH GUARD] Unhandled Rejection:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[CRASH GUARD] Uncaught Exception:', err);
+});
+
+
 const app = express();
 const PORT = process.env.PORT || 3001;
 
@@ -52,6 +61,14 @@ app.get('/deployments', (req, res) => {
 
 // ── Deploy route ─────────────────────────────────────────────────────
 app.use('/deploy', deployRoute);
+
+// ── Logs route ───────────────────────────────────────────────────────
+const logsRoute = require('./routes/logs');
+app.use('/logs', logsRoute);
+
+// ── Sync route ───────────────────────────────────────────────────────
+const syncRoute = require('./routes/sync');
+app.use('/sync', syncRoute);
 
 // ── Error handler ────────────────────────────────────────────────────
 app.use((err, req, res, _next) => {

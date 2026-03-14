@@ -1,0 +1,17 @@
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Accept port as build arg and env var
+ARG PORT=3000
+ENV PORT=${PORT}
+
+# Install dependencies only — source code is bind-mounted at runtime
+COPY package*.json ./
+RUN npm install
+
+# Expose the port
+EXPOSE ${PORT}
+
+# Start the dev server (hot-reload enabled)
+CMD ["npm", "run", "dev"]

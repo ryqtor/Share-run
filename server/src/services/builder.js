@@ -1,190 +1,170 @@
 const Docker = require('dockerode');
 const fs = require('fs-extra');
 const path = require('path');
+const archiver = require('archiver');
 const deploymentStore = require('./deployment-store');
-const { allocatePort } = require('./port-manager');
 const { generateTraefikLabels } = require('./proxy-manager');
 
 const docker = new Docker();
-
 const TEMPLATES_DIR = path.join(__dirname, '..', 'templates');
 
 /**
- * Build and run a Docker container for the given project.
+ * Dev mode creates TWO containers (no bind mounts, putArchive only):
+ *   - Stable (port 5001): always has last WORKING code. Ngrok points here.
+ *   - Dev    (port 5000): receives hot-reloaded files first. Test ground.
  *
- * If a container with the same name already exists, it is stopped and removed
- * to ensure the same domain points to the freshly deployed version.
- *
- * @param {object}   opts
- * @param {string}   opts.projectDir   — absolute path to extracted project
- * @param {string}   opts.stackType    — 'node' | 'nextjs' | 'static'
- * @param {string}   opts.domain       — the deployment domain
- * @param {string}   opts.containerName — unique container name
- * @param {Function} opts.log          — streaming log callback
- * @returns {Promise<{ containerId: string, port: number }>}
+ * On sync → files injected into Dev → if compiles OK → inject into Stable.
+ * If syntax error → Stable untouched → ngrok link stays on working version.
  */
-async function buildAndRun({ projectDir, stackType, domain, containerName, log }) {
-  // 1. Copy the right Dockerfile template into the project directory
-  const dockerfileTemplate = `Dockerfile.${stackType}`;
-  const templatePath = path.join(TEMPLATES_DIR, dockerfileTemplate);
-  const destDockerfile = path.join(projectDir, 'Dockerfile');
+async function buildAndRun({ projectDir, stackType, domain, containerName, mode, log }) {
+  const isDev = mode === 'dev';
+  const dockerfile = isDev ? 'Dockerfile.dev' : `Dockerfile.${stackType}`;
+  const templatePath = path.join(TEMPLATES_DIR, dockerfile);
 
   if (!await fs.pathExists(templatePath)) {
-    throw new Error(`No Dockerfile template found for stack type: ${stackType}`);
+    throw new Error(`Dockerfile template not found: ${dockerfile}`);
   }
+  await fs.copy(templatePath, path.join(projectDir, 'Dockerfile'));
+  log(`📄 Using ${dockerfile}`);
 
-  await fs.copy(templatePath, destDockerfile);
-  log(`📄 Using Dockerfile template: ${dockerfileTemplate}`);
-
-  // 2. Stop and remove existing container (persistent deployment)
-  await stopExistingContainer(containerName, log);
-
-  // 3. Allocate a port
-  const port = allocatePort();
-  log(`🔌 Allocated port: ${port}`);
-
-  // 4. Build the Docker image
-  // Use containerName directly — it already has the "sharerun-" prefix
+  // Build the base image (deps only for dev, full for prod)
   const imageName = `${containerName}:latest`;
-  log(`🔨 Building Docker image: ${imageName}`);
+  log('🔨 Building Docker image…');
+  const filesToSend = isDev
+    ? (await fs.readdir(projectDir)).filter(f => ['package.json', 'package-lock.json', 'Dockerfile'].includes(f))
+    : await getAllFiles(projectDir);
 
-  const buildStream = await docker.buildImage(
-    {
-      context: projectDir,
-      src: await getContextFiles(projectDir),
-    },
-    {
-      t: imageName,
-      buildargs: { PORT: String(port) },
-    }
-  );
-
-  // Stream build output — track errors so we can abort before createContainer
-  let buildError = null;
-  await new Promise((resolve, reject) => {
-    docker.modem.followProgress(
-      buildStream,
-      (err, output) => {
-        if (err) return reject(err);
-        if (buildError) return reject(new Error(`Docker build failed: ${buildError}`));
-        resolve(output);
-      },
-      (event) => {
-        if (event.stream) {
-          const line = event.stream.trim();
-          if (line) log(`  ${line}`);
-        }
-        if (event.error) {
-          buildError = event.error;
-          log(`❌ Build error: ${event.error}`);
-        }
-      }
-    );
+  const buildStream = await docker.buildImage({ context: projectDir, src: filesToSend }, {
+    t: imageName,
+    buildargs: { PORT: '5001' },
   });
+  await followBuild(buildStream, log);
+  log('✅ Image built');
 
-  log('✅ Docker image built successfully');
+  await ensureNetwork('sharerun-network');
 
-  // 5. Generate Traefik labels
-  const labels = generateTraefikLabels(domain, port);
+  if (isDev) {
+    // ── DEV: Start TWO containers ──────────────────────────────────
+    const stableName = `${containerName}-stable`;
+    const devName    = `${containerName}-dev`;
 
-  // 6. Ensure the Docker network exists
-  await ensureNetwork('sharerun-network', log);
+    // Start Stable (5001)
+    await stopContainer(stableName);
+    log('🚀 Starting STABLE container (port 5001)…');
+    const stableContainer = await createAndStart(imageName, stableName, 5001);
+    log('  [OK] Stable started');
 
-  // 7. Run the container
-  log(`🚀 Starting container: ${containerName}`);
+    // Start Dev (5000)
+    await stopContainer(devName);
+    log('🚀 Starting DEV container (port 5000)…');
+    const devContainer = await createAndStart(imageName, devName, 5000);
+    log('  [OK] Dev started');
 
+    // Inject source code into BOTH
+    log('📂 Injecting source code into both containers…');
+    await injectSourceFiles(stableContainer, projectDir);
+    await injectSourceFiles(devContainer, projectDir);
+    log('✅ Source code injected');
+
+    deploymentStore.set(domain, {
+      containerId: stableContainer.id,
+      containerName: stableName,
+      port: 5001,
+      devContainerId: devContainer.id,
+      devContainerName: devName,
+      devPort: 5000,
+      stack: stackType,
+      mode: 'dev',
+      createdAt: new Date().toISOString(),
+    });
+
+    return { containerId: stableContainer.id, port: 5001 };
+  } else {
+    // ── PROD: Single container ─────────────────────────────────────
+    await stopContainer(containerName);
+    const container = await createAndStart(imageName, containerName, 5001);
+    deploymentStore.set(domain, {
+      containerId: container.id,
+      containerName,
+      port: 5001,
+      stack: stackType,
+      mode: 'prod',
+      createdAt: new Date().toISOString(),
+    });
+    return { containerId: container.id, port: 5001 };
+  }
+}
+
+async function createAndStart(image, name, port) {
   const container = await docker.createContainer({
-    Image: imageName,
-    name: containerName,
-    Env: [`PORT=${port}`],
+    Image: image,
+    name: name,
+    Env: [
+      `PORT=${port}`,
+      'NODE_ENV=development',
+      'WATCHPACK_POLLING=true',
+      'CHOKIDAR_USEPOLLING=true',
+    ],
     ExposedPorts: { [`${port}/tcp`]: {} },
     HostConfig: {
-      PortBindings: {
-        [`${port}/tcp`]: [{ HostPort: String(port) }],
-      },
-      Memory: 512 * 1024 * 1024,  // 512 MB
-      NanoCpus: 500000000,         // 0.5 CPU
-      RestartPolicy: { Name: 'unless-stopped' },
+      PortBindings: { [`${port}/tcp`]: [{ HostPort: String(port) }] },
       NetworkMode: 'sharerun-network',
     },
-    Labels: labels,
   });
-
   await container.start();
-  log('✅ Container started');
+  return container;
+}
 
-  // 7. Save deployment info
-  deploymentStore.set(domain, {
-    containerId: container.id,
-    containerName,
-    port,
-    stack: stackType,
-    imageName,
-    createdAt: new Date().toISOString(),
+async function injectSourceFiles(container, sourceDir) {
+  return new Promise((resolve, reject) => {
+    const tar = archiver('tar', { gzip: false });
+    tar.glob('**/*', {
+      cwd: sourceDir,
+      ignore: ['node_modules/**', '.next/**', '.git/**', 'Dockerfile'],
+      dot: true,
+    });
+    tar.finalize();
+    container.putArchive(tar, { path: '/app' }).then(resolve).catch(reject);
   });
-
-  return { containerId: container.id, port };
 }
 
-/**
- * Stop and remove an existing container by name (for redeployment).
- */
-async function stopExistingContainer(containerName, log) {
+function followBuild(stream, log) {
+  return new Promise((resolve, reject) => {
+    docker.modem.followProgress(stream,
+      (err, output) => {
+        if (err) return reject(err);
+        if (output && output.some(o => o.error)) return reject(new Error('Docker build failed'));
+        resolve(output);
+      },
+      (ev) => { if (ev.stream && ev.stream.trim()) log(`  ${ev.stream.trim()}`); }
+    );
+  });
+}
+
+async function stopContainer(name) {
   try {
-    const existing = docker.getContainer(containerName);
-    const info = await existing.inspect();
-
-    if (info.State.Running) {
-      log(`⏹  Stopping existing container: ${containerName}`);
-      await existing.stop();
-    }
-
-    log(`🗑️  Removing existing container: ${containerName}`);
-    await existing.remove();
-  } catch (err) {
-    if (err.statusCode === 404) {
-      // Container doesn't exist — that's fine
-    } else {
-      log(`⚠️  Warning: ${err.message}`);
-    }
-  }
+    const c = docker.getContainer(name);
+    const info = await c.inspect();
+    if (info.State.Running) await c.stop();
+    await c.remove();
+  } catch (_) {}
 }
 
-/**
- * Ensure a Docker network exists, creating it if necessary.
- */
-async function ensureNetwork(networkName, log) {
-  try {
-    const network = docker.getNetwork(networkName);
-    await network.inspect();
-  } catch (err) {
-    if (err.statusCode === 404) {
-      log(`🌐 Creating Docker network: ${networkName}`);
-      await docker.createNetwork({ Name: networkName, Driver: 'bridge' });
-    } else {
-      log(`⚠️  Network check warning: ${err.message}`);
-    }
-  }
+async function ensureNetwork(net) {
+  try { await docker.getNetwork(net).inspect(); }
+  catch (_) { await docker.createNetwork({ Name: net }); }
 }
 
-/**
- * Get the list of files in the project directory for Docker build context.
- */
-async function getContextFiles(dir) {
-  const files = [];
+async function getAllFiles(dir) {
+  const out = [];
   const walk = async (d) => {
-    const entries = await fs.readdir(d, { withFileTypes: true });
-    for (const entry of entries) {
-      const rel = path.relative(dir, path.join(d, entry.name));
-      if (entry.isDirectory()) {
-        await walk(path.join(d, entry.name));
-      } else {
-        files.push(rel.replace(/\\/g, '/'));
-      }
+    for (const e of await fs.readdir(d, { withFileTypes: true })) {
+      if (e.isDirectory()) await walk(path.join(d, e.name));
+      else out.push(path.relative(dir, path.join(d, e.name)).replace(/\\/g, '/'));
     }
   };
   await walk(dir);
-  return files;
+  return out;
 }
 
 module.exports = { buildAndRun };
