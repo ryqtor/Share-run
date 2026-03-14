@@ -68,9 +68,17 @@ router.put('/:deploymentId', upload.single('patch'), async (req, res) => {
         const stableContainer = docker.getContainer(stableContainerId);
         await injectTar(stableContainer, tmp);
         console.log(`[SYNC] ✅ Compiled OK → promoted to STABLE (port 5001)`);
+
+        await fs.remove(req.file.path);
+        await fs.remove(tmp);
+        return res.json({ accepted: true, message: 'Change accepted — live on stable link' });
       } else {
         // 6. Compilation FAILED → DON'T touch stable
         console.log(`[SYNC] ⨯ Compilation FAILED → STABLE untouched (ngrok link safe)`);
+
+        await fs.remove(req.file.path);
+        await fs.remove(tmp);
+        return res.json({ accepted: false, message: 'Syntax error detected — stable link protected' });
       }
     } else {
       // ── SINGLE CONTAINER (fallback) ────────────────────────────────
@@ -83,11 +91,12 @@ router.put('/:deploymentId', upload.single('patch'), async (req, res) => {
     await fs.remove(req.file.path);
     await fs.remove(tmp);
 
-    res.json({ success: true });
+    res.json({ accepted: true, message: 'Hot-reloaded' });
   } catch (err) {
     console.error(`[SYNC ERROR] ${deploymentId}:`, err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ accepted: false, error: err.message });
   }
+
 });
 
 /** Inject a directory as a tar into a container at /app */
@@ -101,14 +110,20 @@ function injectTar(container, sourceDir) {
 }
 
 /**
- * Watch container logs for ~10s looking for compilation result.
- * Returns 'ok' if compiled successfully, 'fail' if error detected.
+ * Watch container logs looking for compilation result.
+ * SAFE DEFAULT: if unsure, returns 'fail' to protect stable link.
  */
-function waitForCompilationResult(container, timeout = 10000) {
+function waitForCompilationResult(container, timeout = 15000) {
   return new Promise((resolve) => {
     let done = false;
+
+    // SAFE DEFAULT: timeout = REJECT (don't promote if unsure)
     const timer = setTimeout(() => {
-      if (!done) { done = true; resolve('ok'); } // timeout = assume ok
+      if (!done) {
+        done = true;
+        console.log('[SYNC] ⏱️  Timeout — no clear success signal → rejecting to be safe');
+        resolve('fail');
+      }
     }, timeout);
 
     container.logs({ follow: true, stdout: true, stderr: true, tail: 0 })
@@ -117,18 +132,53 @@ function waitForCompilationResult(container, timeout = 10000) {
           if (done) return;
           const text = chunk.toString().toLowerCase();
 
-          // Success signals
-          if (text.includes('compiled') || text.includes('ready') || text.includes('compiling /')) {
-            done = true; clearTimeout(timer); stream.destroy(); resolve('ok');
+          // ── CHECK ERRORS FIRST (before success) ──────────────────────
+          const errorPatterns = [
+            'failed to compile',
+            'syntax error',
+            'parsing ecmascript source code failed',
+            'parsing failed',
+            'expression expected',
+            'unexpected token',
+            'unexpected end',
+            'module not found',
+            'error occurred',
+            'build error',
+            'type error',
+            'reference error',
+            'cannot find module',
+          ];
+
+          for (const pattern of errorPatterns) {
+            if (text.includes(pattern)) {
+              done = true; clearTimeout(timer); stream.destroy();
+              console.log(`[SYNC] 🔍 Detected error pattern: "${pattern}"`);
+              resolve('fail');
+              return;
+            }
           }
-          // Failure signals
-          if (text.includes('failed to compile') || text.includes('syntax error') ||
-              text.includes('module not found') || text.includes('error occurred')) {
-            done = true; clearTimeout(timer); stream.destroy(); resolve('fail');
+
+          // ── SUCCESS SIGNALS (only explicit positive ones) ────────────
+          const successPatterns = [
+            'compiled client',       // Next.js Turbopack
+            'compiled server',       // Next.js Turbopack
+            'compiled successfully',
+            'ready in',              // "Ready in 2.3s"
+            'compiled /',            // "Compiling /page..."  then "Compiled /"
+          ];
+
+          for (const pattern of successPatterns) {
+            if (text.includes(pattern)) {
+              done = true; clearTimeout(timer); stream.destroy();
+              resolve('ok');
+              return;
+            }
           }
         });
       })
-      .catch(() => { if (!done) { done = true; resolve('ok'); } });
+      .catch(() => {
+        if (!done) { done = true; resolve('fail'); }
+      });
   });
 }
 

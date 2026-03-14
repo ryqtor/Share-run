@@ -255,12 +255,20 @@ function startFileWatcher({ projectDir, deploymentId }) {
       const formData = new FormData();
       formData.append('patch', fs.createReadStream(zipPath));
 
-      await axios.put(`${SERVER_URL}/sync/${deploymentId}`, formData, {
+      const response = await axios.put(`${SERVER_URL}/sync/${deploymentId}`, formData, {
         headers: formData.getHeaders(),
         timeout: 30000,
       });
 
-      console.log(chalk.green(`[${timestamp}] ✅ Hot-reloaded!`));
+      const data = response.data;
+      if (data.accepted === false) {
+        // Change was REJECTED — syntax error, stable link protected
+        console.log(chalk.red.bold(`[${timestamp}] 🛡️  REJECTED — ${data.message || 'Error detected'}`));
+        console.log(chalk.dim(`           Stable link is still on the last working version`));
+      } else {
+        // Change was ACCEPTED — promoted to stable
+        console.log(chalk.green(`[${timestamp}] ✅ Hot-reloaded! Change is now live.`));
+      }
     } catch (err) {
       console.log(chalk.red(`[${timestamp}] ❌ Sync failed: ${err.message}`));
     } finally {
